@@ -1,50 +1,37 @@
-from typing import (Any, ClassVar, Dict, Final, List, Mapping, Optional,
-                    Sequence, Tuple, cast)
+"""
+Simplified trigger component with WebRTC VAD + Vosk.
 
+Uses VAD to detect speech (low CPU), then Vosk to find trigger word.
+Keeps original AudioResponse chunks with timestamps.
+"""
+
+from typing import ClassVar, Mapping, Optional, Sequence, Tuple, cast
 import asyncio
 import json
 import os
-import time
-import logging
-import speech_recognition as sr
 from vosk import Model as VoskModel, KaldiRecognizer
+import webrtcvad
 from typing_extensions import Self
-from viam.components.audio_in import *
+from viam.components.audio_in import AudioIn
 from viam.proto.app.robot import ComponentConfig
-from viam.proto.common import Geometry, ResourceName
+from viam.proto.common import ResourceName
 from viam.resource.base import ResourceBase
 from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
-from viam.utils import ValueTypes, struct_to_dict
-from viam.streams import Stream, StreamWithIterator
-from hearken import Listener
-from hearken.vad import WebRTCVAD
-from .viamaudiosource import ViamAudioInSource
-
-
+from viam.utils import struct_to_dict
+from viam.streams import StreamWithIterator
 
 
 class Trigger(AudioIn, EasyResource):
-    # To enable debug-level logging, either run viam-server with the --debug option,
-    # or configure your resource/machine to display debug logs.
+    """Simplified trigger component without hearken."""
+
     MODEL: ClassVar[Model] = Model(ModelFamily("viam", "filter-mic"), "trigger")
 
     @classmethod
-    def new(
-        cls, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
-    ) -> Self:
-        """This method creates a new instance of this AudioIn component.
-        The default implementation sets the name from the `config` parameter.
-
-        Args:
-            config (ComponentConfig): The configuration for this resource
-            dependencies (Mapping[ResourceName, ResourceBase]): The dependencies (both required and optional)
-
-        Returns:
-            Self: The resource
-        """
+    def new(cls, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]) -> Self:
+        """Create new trigger component."""
         instance = super().new(config, dependencies)
-        instance.logger.info("=== Trigger component initialization started ===")
+        instance.logger.info("=== Simple Trigger Init ===")
 
         attrs = struct_to_dict(config.attributes)
         microphone = str(attrs.get("source_microphone", ""))
@@ -52,302 +39,205 @@ class Trigger(AudioIn, EasyResource):
         model_path = str(attrs.get("vosk_model_path", "~/vosk-model-small-en-us-0.15"))
         vad_aggressiveness = int(attrs.get("vad_aggressiveness", 3))  # 0-3, higher = less sensitive
 
-        instance.logger.info(f"Config: microphone='{microphone}', trigger_word='{instance.trigger_word}'")
+        instance.logger.info(f"Trigger word: '{instance.trigger_word}'")
+        instance.logger.info(f"VAD aggressiveness: {vad_aggressiveness}")
 
-        # Set up VOSK model with automatic download fallback
+        # Initialize WebRTC VAD (lightweight!)
+        instance.vad = webrtcvad.Vad(vad_aggressiveness)
+        instance.logger.info("WebRTC VAD initialized")
+
+        # Load Vosk model
         model_path = os.path.expanduser(model_path)
-        instance.logger.info(f"Expanded model path: {model_path}")
-
         if not os.path.exists(model_path):
-            instance.logger.info(f"Vosk model not found at {model_path}, attempting to download...")
-            if not instance._download_model():
-                instance.logger.error("Failed to download Vosk model")
-                raise RuntimeError(f"Vosk model not found at {model_path} and download failed")
+            instance.logger.error(f"Vosk model not found at {model_path}")
+            raise RuntimeError(f"Vosk model not found at {model_path}")
 
-        try:
-            instance.logger.info("Loading Vosk model...")
-            instance.vosk_model = VoskModel(model_path)
-            instance.logger.info(f"Successfully loaded Vosk model from {model_path}")
-        except Exception as e:
-            instance.logger.error(f"Failed to load Vosk model: {e}")
-            raise RuntimeError(f"Failed to load Vosk model from {model_path}: {e}")
+        instance.vosk_model = VoskModel(model_path)
+        instance.logger.info("Vosk model loaded")
 
-        instance.vosk_recognizer = None  # Will be created per audio segment
-
-        # Initialize trigger state
-        instance.logger.info("Initializing trigger state...")
-        instance.buffer_duration_ns = int(attrs.get("buffer_seconds", 5)) * 1_000_000_000  # Default 5 seconds
-        instance.last_chunk_timestamp_ns = 0  # Track most recent audio timestamp
-        instance.trigger_detected = False  # Flag for trigger word detection
-        instance.trigger_timestamp_ns = 0  # Timestamp when trigger was detected
-        instance.trigger_segment_duration_ns = 0  # Duration of trigger segment
-        instance.logger.info(f"Trigger state initialized (buffer: {instance.buffer_duration_ns / 1_000_000_000}s)")
-
-        if microphone != "":
-            instance.logger.info(f"Setting up microphone client: {microphone}")
+        # Get microphone
+        if microphone:
             mic = dependencies[AudioIn.get_resource_name(microphone)]
             instance.microphone_client = cast(AudioIn, mic)
-            instance.logger.info("Microphone client set up successfully")
-
-            # Get the running event loop
-            instance.logger.info("Getting event loop...")
-            try:
-                instance.main_loop = asyncio.get_running_loop()
-                instance.logger.info("Using running event loop")
-            except RuntimeError:
-                instance.main_loop = asyncio.get_event_loop()
-                instance.logger.info("Created new event loop")
-
-            # Set up hearken listener with ViamAudioInSource
-            instance.logger.info("Creating ViamAudioInSource...")
-            instance.audio_source = ViamAudioInSource(
-                microphone_client=instance.microphone_client,
-                logger=instance.logger
-            )
-            instance.logger.info("ViamAudioInSource created successfully")
-
-            # Set up VAD
-            instance.logger.info(f"Creating listener VAD with aggressiveness={vad_aggressiveness}...")
-            vad = WebRTCVAD(aggressiveness=vad_aggressiveness)
-            instance.logger.info("Listener VAD created successfully")
-
-            # Set up listener with callbacks and event loop
-            instance.logger.info("Creating hearken Listener...")
-            instance.listener = Listener(
-                source=instance.audio_source,
-                vad=vad,
-                on_error=lambda err: instance.logger.error(f"hearken listener error: {err}"),
-                on_speech=lambda segment: instance.listen_callback(
-                    sr.AudioData(
-                        segment.audio_data,
-                        segment.sample_rate,
-                        segment.sample_width,
-                    )
-                ),
-                event_loop=instance.main_loop,
-            )
-            instance.listener_started = False
-            instance.logger.info("Listener created successfully")
+            instance.logger.info(f"Microphone: {microphone}")
         else:
-            instance.logger.info("No microphone configured, skipping audio setup")
             instance.microphone_client = None
-            instance.audio_source = None
-            instance.listener = None
-            instance.main_loop = None
-            instance.listener_started = False
 
-        instance.logger.info("=== Trigger component initialization completed ===")
-
-        hearken_logger = logging.getLogger("hearken")
-        hearken_logger.setLevel(logging.DEBUG)
+        instance.logger.info("=== Init Complete ===")
         return instance
 
     @classmethod
-    def validate_config(
-        cls, config: ComponentConfig
-    ) -> Tuple[Sequence[str], Sequence[str]]:
-        """This method allows you to validate the configuration object received from the machine,
-        as well as to return any required dependencies or optional dependencies based on that `config`.
-
-        Args:
-            config (ComponentConfig): The configuration for this resource
-
-        Returns:
-            Tuple[Sequence[str], Sequence[str]]: A tuple where the
-                first element is a list of required dependencies and the
-                second element is a list of optional dependencies
-        """
+    def validate_config(cls, config: ComponentConfig) -> Tuple[Sequence[str], Sequence[str]]:
+        """Validate configuration."""
         deps = []
         attrs = struct_to_dict(config.attributes)
         microphone = str(attrs.get("source_microphone", ""))
-        if microphone != "":
+        if microphone:
             deps.append(microphone)
         return deps, []
 
-    def listen_callback(self, audio_data: sr.AudioData):
-        """Handle speech segments detected by hearken listener.
+    def check_for_trigger(self, audio_bytes: bytes, sample_rate: int = 16000) -> bool:
+        """
+        Check if trigger word is in audio.
 
         Args:
-            audio_data: Speech audio data from the listener
-        """
-        # Calculate segment duration
-        segment_duration_seconds = len(audio_data.frame_data) / (audio_data.sample_rate * audio_data.sample_width)
+            audio_bytes: Raw PCM16 audio data
+            sample_rate: Audio sample rate
 
-        # Ignore very short segments (likely just noise clicks)
-        if segment_duration_seconds < 0.5:  # Less than 500ms
-            self.logger.debug(f"Ignoring short segment: {segment_duration_seconds:.2f}s")
+        Returns:
+            bool: True if trigger word detected
+        """
+        try:
+            recognizer = KaldiRecognizer(self.vosk_model, sample_rate)
+            recognizer.AcceptWaveform(audio_bytes)
+            result = json.loads(recognizer.FinalResult())
+            text = result.get("text", "").lower()
+
+            if text:
+                self.logger.debug(f"Recognized: {text}")
+
+            if self.trigger_word and self.trigger_word in text:
+                self.logger.info(f"TRIGGER WORD '{self.trigger_word}' DETECTED!")
+                return True
+
+            return False
+        except Exception as e:
+            self.logger.error(f"Vosk error: {e}")
+            return False
+
+    async def get_audio(self, codec: str, duration_seconds: float, previous_timestamp_ns: int, **kwargs):
+        """
+        Stream audio, yielding buffered chunks when trigger word detected.
+
+        Uses WebRTC VAD to detect speech (low CPU), then Vosk to find trigger.
+
+        Args:
+            codec: Audio codec (should be "pcm16")
+            duration_seconds: Duration (use 0 for continuous)
+            previous_timestamp_ns: Previous timestamp (use 0 to start)
+
+        Yields:
+            AudioResponse chunks with original timestamps
+        """
+        if not self.microphone_client:
+            self.logger.error("No microphone configured")
             return
 
-        self.logger.info(f"Speech detected: {len(audio_data.frame_data)} bytes ({segment_duration_seconds:.1f}s)")
-
-        # Create a new recognizer for this audio segment
-        recognizer = KaldiRecognizer(self.vosk_model, audio_data.sample_rate)
-
-        # Process the audio data
-        recognizer.AcceptWaveform(audio_data.get_raw_data())
-
-        # Get the final result (forces Vosk to finalize)
-        result = json.loads(recognizer.FinalResult())
-        recognized_text = result.get("text", "").lower()
-
-        if recognized_text:
-            self.logger.info(f"Recognized: {recognized_text}")
-
-            # Check if trigger word is present
-            if self.trigger_word and self.trigger_word in recognized_text:
-                self.logger.info(f"Trigger word '{self.trigger_word}' detected!")
-
-                # Calculate segment duration from audio data
-                segment_duration_seconds = len(audio_data.frame_data) / (audio_data.sample_rate * audio_data.sample_width)
-                segment_duration_ns = int(segment_duration_seconds * 1_000_000_000)
-                self.logger.info(f"Segment duration: {segment_duration_seconds:.2f}s ({segment_duration_ns}ns)")
-
-                self.on_trigger_detected(recognized_text, segment_duration_ns)
-        else:
-            self.logger.debug("No text recognized in this segment")
-
-    def on_trigger_detected(self, recognized_text: str, segment_duration_ns: int):
-        """Called when the trigger word is detected.
-
-        Args:
-            recognized_text: The full recognized text containing the trigger word
-            segment_duration_ns: Duration of the speech segment in nanoseconds
-        """
-        self.logger.info(f"TRIGGER DETECTED! Text: {recognized_text}")
-
-        # Store the segment duration for historical fetch
-        self.trigger_segment_duration_ns = segment_duration_ns
-
-        # Use the most recent audio chunk timestamp (not system time)
-        self.trigger_timestamp_ns = self.last_chunk_timestamp_ns
-        self.trigger_detected = True
-        self.logger.info(f"Trigger at audio timestamp {self.trigger_timestamp_ns}, will fetch {segment_duration_ns / 1_000_000_000:.2f}s of historical audio")
-
-    async def get_audio(
-            self,
-            codec: str,
-            duration_seconds: float,
-            previous_timestamp_ns: int,
-            *,
-            timeout: Optional[float] = None,
-            **kwargs
-    ) -> Stream[AudioResponse]:
-        self.logger.info("filter: get_audio called")
-
-        # Start the listener on first call
-        if self.listener is not None and not self.listener_started:
-            self.logger.info("Starting hearken listener")
-            self.listener.start()
-            self.listener_started = True
-
-        # Define the async generator for streaming audio
         async def audio_generator():
-            if self.microphone_client is not None:
-                # Start monitoring stream to track timestamps
-                self.logger.info("Starting to monitor audio stream for timestamps")
-                monitor_stream = await self.microphone_client.get_audio(codec, duration_seconds, previous_timestamp_ns)
+            self.logger.info("Starting trigger detection with VAD...")
 
-                first_chunk = True
-                async for chunk in monitor_stream:
-                    # Track the most recent timestamp
-                    if chunk.audio.end_timestamp_nanoseconds > 0:
-                        self.last_chunk_timestamp_ns = chunk.audio.end_timestamp_nanoseconds
+            # Get continuous stream from microphone
+            mic_stream = await self.microphone_client.get_audio(codec, 0, 0)
 
-                    # Yield first chunk to unblock Go client
-                    if first_chunk:
-                        yield chunk
-                        first_chunk = False
+            # Buffers
+            chunk_buffer = []  # AudioResponse objects (with timestamps!)
+            byte_buffer = bytearray()
 
-                    # Check for trigger signal
-                    if self.trigger_detected:
-                        self.logger.info(f"Fetching historical audio from {self.trigger_segment_duration_ns / 1_000_000_000}s ago")
+            # Speech detection state
+            is_speech_active = False
+            silence_frames = 0
+            max_silence_frames = 30  # ~1 second of silence to end speech
 
-                        # Request historical audio from microphone's buffer
-                        historical_start = self.trigger_timestamp_ns - self.trigger_segment_duration_ns
-                        buffer_duration_seconds = self.trigger_segment_duration_ns / 1_000_000_000
-                        historical_stream = await self.microphone_client.get_audio(
-                            codec,
-                            duration_seconds=buffer_duration_seconds,
-                            previous_timestamp_ns=historical_start
-                        )
+            async for response in mic_stream:
+                audio_data = response.audio.audio_data
 
-                        # Yield all historical audio (will stop after duration_seconds)
-                        async for historical_chunk in historical_stream:
-                            yield historical_chunk
+                if not audio_data:
+                    continue
 
-                        self.trigger_detected = False
-                        self.logger.info("Finished replaying historical audio")
+                # Check PCM16 alignment (2 bytes per sample)
+                if len(audio_data) % 2 != 0:
+                    self.logger.warning(f"Misaligned audio chunk detected: {len(audio_data)} bytes (odd length)")
 
-        # Wrap the generator in StreamWithIterator and return it
+                # WebRTC VAD requires specific frame sizes (10, 20, or 30ms)
+                # At 16kHz: 30ms = 480 samples = 960 bytes
+                frame_size = 960
+
+                # Track if we should process this batch
+                should_process = False
+
+                # Process audio in VAD-compatible frames
+                for i in range(0, len(audio_data), frame_size):
+                    frame = audio_data[i:i + frame_size]
+
+                    if len(frame) < frame_size:
+                        continue  # Skip incomplete frames
+
+                    # Check if frame contains speech (vad is cheap CPU)
+                    try:
+                        is_speech = self.vad.is_speech(frame, 16000)
+                    except:
+                        is_speech = False
+
+                    if is_speech:
+                        if not is_speech_active:
+                            self.logger.debug("Speech started")
+                            is_speech_active = True
+                        silence_frames = 0
+                    else:
+                        if is_speech_active:
+                            silence_frames += 1
+
+                            if silence_frames >= max_silence_frames:
+                                self.logger.debug(f"Speech ended ({silence_frames} silent frames)")
+                                should_process = True
+                                break  # Exit frame loop
+
+                # Only buffer during active speech (not during silence)
+                if is_speech_active:
+                    chunk_buffer.append(response)
+                    byte_buffer.extend(audio_data)
+
+                # If speech ended, check for trigger
+                if should_process:
+                    self.logger.debug(f"Checking {len(byte_buffer)} bytes for trigger")
+
+                    # Only run Vosk on speech segments to save CPU time
+                    if self.check_for_trigger(bytes(byte_buffer)):
+                        # Trigger detected! Yield all buffered chunks
+                        self.logger.info(f"TRIGGER! Yielding {len(chunk_buffer)} chunks ({len(byte_buffer)} bytes)")
+
+                        for chunk in chunk_buffer:
+                            yield chunk
+
+                        self.logger.info("Ready for next trigger")
+                    else:
+                        self.logger.debug("No trigger found")
+
+                    # Clear buffers either way
+                    chunk_buffer.clear()
+                    byte_buffer.clear()
+                    is_speech_active = False
+                    silence_frames = 0
+
+                # Prevent buffers from growing too large (safety)
+                if len(byte_buffer) > 500000:  # ~15 seconds max
+                    self.logger.warning("Buffer too large, force checking")
+
+                    if self.check_for_trigger(bytes(byte_buffer)):
+                        self.logger.info(f"TRIGGER! Yielding {len(chunk_buffer)} chunks")
+                        for chunk in chunk_buffer:
+                            yield chunk
+
+                    chunk_buffer.clear()
+                    byte_buffer.clear()
+                    is_speech_active = False
+                    silence_frames = 0
+
         return StreamWithIterator(audio_generator())
 
     async def close(self):
-        """Clean up resources when component is closed."""
-        if self.listener is not None and self.listener_started:
-            self.logger.info("Stopping hearken listener")
-            self.listener.stop()
-            self.listener_started = False
+        """Clean up resources."""
+        self.logger.info("Closing trigger component")
 
-        if self.audio_source is not None:
-            self.audio_source.close()
-
-    async def do_command(
-        self,
-        command: Mapping[str, ValueTypes],
-        *,
-        timeout: Optional[float] = None,
-        **kwargs
-    ) -> Mapping[str, ValueTypes]:
-        self.logger.error("`do_command` is not implemented")
+    async def do_command(self, command, **kwargs):
         raise NotImplementedError()
 
-    async def get_geometries(
-        self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None
-    ) -> Sequence[Geometry]:
-        self.logger.error("`get_geometries` is not implemented")
+    async def get_geometries(self, **kwargs):
         raise NotImplementedError()
 
-
-    def _download_model(self) -> bool:
-        """Download Vosk model automatically"""
-        try:
-            import urllib.request
-            import zipfile
-            import ssl
-            import certifi
-
-            model_name = "vosk-model-small-en-us-0.15"
-            model_url = f"https://alphacephei.com/vosk/models/{model_name}.zip"
-            model_path = os.path.expanduser(f"~/{model_name}")
-            zip_path = os.path.expanduser(f"~/{model_name}.zip")
-
-            self.logger.debug(f"Downloading Vosk model from {model_url}")
-
-            # Download with SSL context using certifi certificates
-            ssl_context = ssl.create_default_context(cafile=certifi.where())
-            with urllib.request.urlopen(model_url, context=ssl_context) as response:
-                with open(zip_path, 'wb') as out_file:
-                    out_file.write(response.read())
-
-            # Extract
-            self.logger.debug("Extracting Vosk model...")
-            with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                zip_ref.extractall(os.path.expanduser("~/"))
-
-            # Clean up
-            os.remove(zip_path)
-
-            if os.path.exists(model_path):
-                self.logger.debug(f"Vosk model downloaded to {model_path}")
-                return True
-            else:
-                self.logger.error("Failed to extract Vosk model")
-                return False
-
-        except Exception as e:
-            self.logger.error(f"Failed to download Vosk model: {e}")
-            return False
-
-    async def get_properties(self, *, timeout: Optional[float] = None, **kwargs) -> AudioIn.Properties:
-        self.logger.debug(f"in get rpoeprties")
-
+    async def get_properties(self, **kwargs):
+        self.logger.debug("get_properties called")
+        # Return properties from underlying microphone
+        if self.microphone_client:
+            return await self.microphone_client.get_properties()
+        return AudioIn.Properties(sample_rate_hz=16000, channel_count=1)
