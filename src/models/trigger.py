@@ -1,9 +1,3 @@
-"""
-Simplified trigger component with WebRTC VAD + Vosk.
-
-Uses VAD to detect speech (low CPU), then Vosk to find trigger word.
-Keeps original AudioResponse chunks with timestamps.
-"""
 
 from typing import ClassVar, Mapping, Optional, Sequence, Tuple, cast
 import asyncio
