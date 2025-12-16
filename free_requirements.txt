@@ -1,0 +1,32 @@
+# Free voice assistant requirements
+# No API keys needed!
+
+# Viam SDK
+viam-sdk>=0.63.0
+
+# Google Speech Recognition (free, no API key!)
+SpeechRecognition>=3.10.0
+
+# Google Text-to-Speech (free, no API key!)
+gTTS>=2.5.0
+
+# Audio processing (needed for format conversion)
+pydub>=0.25.1
+
+# For Ollama example (optional)
+requests>=2.31.0
+
+# ============================================
+# System Dependencies
+# ============================================
+# Install via your system package manager:
+#
+# macOS:
+#   brew install espeak ffmpeg
+#
+# Ubuntu/Debian:
+#   sudo apt-get install espeak espeak-data libespeak-dev ffmpeg
+#
+# Windows:
+#   Download espeak from: http://espeak.sourceforge.net/download.html
+#   Download ffmpeg from: https://ffmpeg.org/download.html

@@ -1,0 +1,10 @@
+# Requirements for the example client scripts
+
+# Viam SDK
+viam-sdk>=0.63.0
+
+
+# Audio processing
+pydub>=0.25.1
+
+

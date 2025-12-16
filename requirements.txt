@@ -1,0 +1,7 @@
+
+viam-sdk==0.63.0
+
+typing-extensions
+hearken[webrtc,silero,sr]~=0.4.0
+vosk~=0.3.44
+pydub~=0.25.1
