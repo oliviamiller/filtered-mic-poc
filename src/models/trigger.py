@@ -3,6 +3,8 @@ from typing import ClassVar, Mapping, Optional, Sequence, Tuple, cast
 import asyncio
 import json
 import os
+import urllib.request
+import zipfile
 from vosk import Model as VoskModel, KaldiRecognizer
 import webrtcvad
 from typing_extensions import Self
@@ -14,6 +16,58 @@ from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
 from viam.utils import struct_to_dict
 from viam.streams import StreamWithIterator
+
+
+def download_vosk_model(model_name: str = "vosk-model-small-en-us-0.15", logger=None) -> str:
+    """
+    Download Vosk model if not present.
+
+    Args:
+        model_name: Name of the Vosk model to download
+        logger: Optional logger instance
+
+    Returns:
+        Path to the model directory
+    """
+    model_dir = os.path.expanduser(f"~/{model_name}")
+
+    if os.path.exists(model_dir):
+        if logger:
+            logger.info(f"Vosk model already exists at {model_dir}")
+        return model_dir
+
+    url = f"https://alphacephei.com/vosk/models/{model_name}.zip"
+    zip_path = f"/tmp/{model_name}.zip"
+
+    if logger:
+        logger.info(f"Downloading Vosk model from {url}...")
+    else:
+        print(f"Downloading Vosk model from {url}...")
+
+    try:
+        urllib.request.urlretrieve(url, zip_path)
+
+        if logger:
+            logger.info(f"Extracting to {model_dir}...")
+        else:
+            print(f"Extracting to {model_dir}...")
+
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(os.path.expanduser("~"))
+
+        os.remove(zip_path)
+
+        if logger:
+            logger.info(f"Vosk model downloaded successfully to {model_dir}")
+        else:
+            print(f"Vosk model downloaded successfully to {model_dir}")
+
+        return model_dir
+
+    except Exception as e:
+        if logger:
+            logger.error(f"Failed to download Vosk model: {e}")
+        raise RuntimeError(f"Failed to download Vosk model: {e}")
 
 
 class Trigger(AudioIn, EasyResource):
@@ -40,11 +94,19 @@ class Trigger(AudioIn, EasyResource):
         instance.vad = webrtcvad.Vad(vad_aggressiveness)
         instance.logger.info("WebRTC VAD initialized")
 
-        # Load Vosk model
+        # Load Vosk model (download if needed)
         model_path = os.path.expanduser(model_path)
+
+        # If path doesn't exist, try to download the default model
         if not os.path.exists(model_path):
-            instance.logger.error(f"Vosk model not found at {model_path}")
-            raise RuntimeError(f"Vosk model not found at {model_path}")
+            instance.logger.info(f"Vosk model not found at {model_path}, attempting download...")
+            # Extract model name from path
+            model_name = os.path.basename(model_path)
+            try:
+                model_path = download_vosk_model(model_name, instance.logger)
+            except Exception as e:
+                instance.logger.error(f"Failed to download model: {e}")
+                raise RuntimeError(f"Vosk model not found at {model_path} and download failed: {e}")
 
         instance.vosk_model = VoskModel(model_path)
         instance.logger.info("Vosk model loaded")
