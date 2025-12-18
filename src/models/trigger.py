@@ -5,6 +5,7 @@ import json
 import os
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from vosk import Model as VoskModel, KaldiRecognizer
 import webrtcvad
 from typing_extensions import Self
@@ -111,6 +112,10 @@ class Trigger(AudioIn, EasyResource):
         instance.vosk_model = VoskModel(model_path)
         instance.logger.info("Vosk model loaded")
 
+        # Create thread pool for Vosk processing (non-blocking)
+        instance.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vosk")
+        instance.logger.info("Thread pool executor created for Vosk processing")
+
         # Get microphone
         if microphone:
             mic = dependencies[AudioIn.get_resource_name(microphone)]
@@ -144,13 +149,24 @@ class Trigger(AudioIn, EasyResource):
             bool: True if trigger word detected
         """
         try:
+            self.logger.debug(f"check_for_trigger: {len(audio_bytes)} bytes, {sample_rate} Hz")
+
             recognizer = KaldiRecognizer(self.vosk_model, sample_rate)
-            recognizer.AcceptWaveform(audio_bytes)
+
+            # Process audio
+            accepted = recognizer.AcceptWaveform(audio_bytes)
+            self.logger.debug(f"AcceptWaveform returned: {accepted}")
+
+            # Get final result
             result = json.loads(recognizer.FinalResult())
+            self.logger.info(f"Vosk full result: {result}")
+
             text = result.get("text", "").lower()
 
             if text:
-                self.logger.debug(f"Recognized: {text}")
+                self.logger.info(f"Recognized text: '{text}'")
+            else:
+                self.logger.warning("Vosk returned EMPTY text - no speech recognized!")
 
             if self.trigger_word and self.trigger_word in text:
                 self.logger.info(f"TRIGGER WORD '{self.trigger_word}' DETECTED!")
@@ -158,7 +174,7 @@ class Trigger(AudioIn, EasyResource):
 
             return False
         except Exception as e:
-            self.logger.error(f"Vosk error: {e}")
+            self.logger.error(f"Vosk error: {e}", exc_info=True)
             return False
 
     async def get_audio(self, codec: str, duration_seconds: float, previous_timestamp_ns: int, **kwargs):
@@ -181,6 +197,10 @@ class Trigger(AudioIn, EasyResource):
 
         async def audio_generator():
             self.logger.info("Starting trigger detection with VAD...")
+
+            # Check mic properties
+            mic_props = await self.microphone_client.get_properties()
+            self.logger.info(f"Microphone properties - Sample rate: {mic_props.sample_rate_hz} Hz, Channels: {mic_props.channel_count}, Codec: {codec}")
 
             # Get continuous stream from microphone
             mic_stream = await self.microphone_client.get_audio(codec, 0, 0)
@@ -247,8 +267,16 @@ class Trigger(AudioIn, EasyResource):
                 if should_process:
                     self.logger.debug(f"Checking {len(byte_buffer)} bytes for trigger")
 
-                    # Only run Vosk on speech segments to save CPU time
-                    if self.check_for_trigger(bytes(byte_buffer)):
+                    # Run Vosk in thread pool to avoid blocking event loop
+                    loop = asyncio.get_event_loop()
+                    audio_to_check = bytes(byte_buffer)
+                    trigger_detected = await loop.run_in_executor(
+                        self.executor,
+                        self.check_for_trigger,
+                        audio_to_check
+                    )
+
+                    if trigger_detected:
                         # Trigger detected! Yield all buffered chunks
                         self.logger.info(f"TRIGGER! Yielding {len(chunk_buffer)} chunks ({len(byte_buffer)} bytes)")
 
@@ -269,7 +297,16 @@ class Trigger(AudioIn, EasyResource):
                 if len(byte_buffer) > 500000:  # ~15 seconds max
                     self.logger.warning("Buffer too large, force checking")
 
-                    if self.check_for_trigger(bytes(byte_buffer)):
+                    # Run Vosk in thread pool (non-blocking)
+                    loop = asyncio.get_event_loop()
+                    audio_to_check = bytes(byte_buffer)
+                    trigger_detected = await loop.run_in_executor(
+                        self.executor,
+                        self.check_for_trigger,
+                        audio_to_check
+                    )
+
+                    if trigger_detected:
                         self.logger.info(f"TRIGGER! Yielding {len(chunk_buffer)} chunks")
                         for chunk in chunk_buffer:
                             yield chunk
