@@ -129,10 +129,13 @@ class SimpleVoiceAssistant:
 
 async def main():
     opts = RobotClient.Options.with_api_key(
-        api_key='<API_KEY>',
-        api_key_id='<API_KEY_ID>'
+
+        api_key='3td02koc3erzfyofi6rx2zu6uygeybay',
+
+        api_key_id='36b8d920-9271-4dd7-95da-17147a640591'
     )
-    robot =  await RobotClient.at_address(<ADDRESS>, opts)
+    robot = await RobotClient.at_address('lorawan-main.ytxdza0q92.viam.cloud', opts)
+
 
     try:
         assistant = SimpleVoiceAssistant(robot, "filter", "speaker")
