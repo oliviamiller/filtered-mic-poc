@@ -199,8 +199,8 @@ class Trigger(AudioIn, EasyResource):
             self.logger.info("Starting trigger detection with VAD...")
 
             # Check mic properties
-            mic_props = await self.microphone_client.get_properties()
-            self.logger.info(f"Microphone properties - Sample rate: {mic_props.sample_rate_hz} Hz, Channels: {mic_props.channel_count}, Codec: {codec}")
+            #mic_props = await self.microphone_client.get_properties()
+            #self.logger.info(f"Microphone properties - Sample rate: {mic_props.sample_rate_hz} Hz, Channels: {mic_props.channel_count}, Codec: {codec}")
 
             # Get continuous stream from microphone
             mic_stream = await self.microphone_client.get_audio(codec, 0, 0)
